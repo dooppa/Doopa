@@ -9,8 +9,12 @@ require_once __DIR__ . '/../../config/database.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-function sendJson(bool $success, string $message, array $data = [], int $statusCode = 200): void
-{
+function sendJson(
+    bool $success,
+    string $message,
+    array $data = [],
+    int $statusCode = 200
+): void {
     http_response_code($statusCode);
 
     echo json_encode([
@@ -27,7 +31,6 @@ function sendJson(bool $success, string $message, array $data = [], int $statusC
 | Authentication
 |--------------------------------------------------------------------------
 */
-
 if (
     !isset($_SESSION['logged_in'], $_SESSION['user_id']) ||
     $_SESSION['logged_in'] !== true
@@ -35,37 +38,46 @@ if (
     sendJson(false, 'Authentication required.', [], 401);
 }
 
+$userId = (int) $_SESSION['user_id'];
+
 /*
 |--------------------------------------------------------------------------
-| Request Method
+| Request method
 |--------------------------------------------------------------------------
 */
-
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     sendJson(false, 'Only GET requests are allowed.', [], 405);
 }
 
 /*
 |--------------------------------------------------------------------------
-| Business ID
+| Education ID
+|--------------------------------------------------------------------------
+|
+| Accepts:
+| 52
+| 000052
+|
+| Rejects:
+| empty
+| abc
+| 0
+| -1
+| 52.5
+|
 |--------------------------------------------------------------------------
 */
+$id = trim((string) ($_GET['id'] ?? ''));
 
-if (!isset($_GET['id'])) {
-    sendJson(false, 'Business id is required.', [], 422);
+if ($id === '' || !ctype_digit($id)) {
+    sendJson(false, 'Education id is required.', [], 422);
 }
 
-$businessId = filter_var($_GET['id'], FILTER_VALIDATE_INT);
+$educationId = (int) $id;
 
-if ($businessId === false || $businessId <= 0) {
-    sendJson(false, 'A valid business id is required.', [], 422);
+if ($educationId <= 0) {
+    sendJson(false, 'Education id is required.', [], 422);
 }
-
-/*
-|--------------------------------------------------------------------------
-| Database
-|--------------------------------------------------------------------------
-*/
 
 try {
     $database = new Database();
@@ -73,56 +85,44 @@ try {
 
     /*
     |--------------------------------------------------------------------------
-    | Get Active Business
+    | Get education record belonging to logged-in user
     |--------------------------------------------------------------------------
     */
-
     $stmt = $pdo->prepare(
         'SELECT
             id,
-            owner_id,
-            name,
-            slug,
+            user_id,
+            institution,
+            qualification,
+            field_of_study,
+            start_date,
+            end_date,
             description,
-            category,
-            phone,
-            email,
-            website,
-            address,
-            logo_url,
-            status,
             created_at,
             updated_at
-         FROM businesses
-         WHERE id = :id
-           AND status = "active"
-         LIMIT 1'
+        FROM education
+        WHERE id = :id
+          AND user_id = :user_id
+        LIMIT 1'
     );
 
     $stmt->execute([
-        ':id' => $businessId
+        ':id' => $educationId,
+        ':user_id' => $userId
     ]);
 
-    $business = $stmt->fetch(PDO::FETCH_ASSOC);
+    $education = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$business) {
-        sendJson(false, 'Business not found.', [], 404);
+    if (!$education) {
+        sendJson(false, 'Education record not found.', [], 404);
     }
 
     sendJson(
         true,
-        'Business retrieved successfully.',
-        [
-            'business' => $business
-        ]
+        'Education retrieved successfully.',
+        $education
     );
 
 } catch (PDOException $e) {
-
-    sendJson(
-        false,
-        'Database error.',
-        [],
-        500
-    );
+    sendJson(false, 'Database error.', [], 500);
 }

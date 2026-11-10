@@ -9,8 +9,12 @@ require_once __DIR__ . '/../../config/database.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-function sendJson(bool $success, string $message, array $data = [], int $statusCode = 200): void
-{
+function sendJson(
+    bool $success,
+    string $message,
+    array $data = [],
+    int $statusCode = 200
+): void {
     http_response_code($statusCode);
 
     echo json_encode([
@@ -24,10 +28,53 @@ function sendJson(bool $success, string $message, array $data = [], int $statusC
 
 /*
 |--------------------------------------------------------------------------
+| Validate date
+|--------------------------------------------------------------------------
+*/
+function validateDate(?string $date, string $fieldName): void
+{
+    if ($date === null) {
+        return;
+    }
+
+    // Must be exactly YYYY-MM-DD
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        sendJson(
+            false,
+            "Invalid {$fieldName}. Date must use YYYY-MM-DD format.",
+            [],
+            422
+        );
+    }
+
+    [$year, $month, $day] = array_map('intval', explode('-', $date));
+
+    // Prevent year 0000
+    if ($year < 1) {
+        sendJson(
+            false,
+            "Invalid {$fieldName}.",
+            [],
+            422
+        );
+    }
+
+    // Validate actual calendar date
+    if (!checkdate($month, $day, $year)) {
+        sendJson(
+            false,
+            "Invalid {$fieldName}.",
+            [],
+            422
+        );
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
 | Authentication
 |--------------------------------------------------------------------------
 */
-
 if (
     !isset($_SESSION['logged_in'], $_SESSION['user_id']) ||
     $_SESSION['logged_in'] !== true
@@ -39,175 +86,234 @@ $userId = (int) $_SESSION['user_id'];
 
 /*
 |--------------------------------------------------------------------------
-| Request Method
+| Request method
 |--------------------------------------------------------------------------
 */
-
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     sendJson(false, 'Only POST requests are allowed.', [], 405);
 }
 
 /*
 |--------------------------------------------------------------------------
-| Business ID
+| Read JSON body
 |--------------------------------------------------------------------------
 */
+$rawInput = file_get_contents('php://input');
 
-if (!isset($_POST['business_id'])) {
-    sendJson(false, 'Business id is required.', [], 422);
+$input = json_decode($rawInput, true);
+
+if (!is_array($input)) {
+    sendJson(false, 'Invalid JSON input.', [], 400);
 }
 
-$businessId = filter_var($_POST['business_id'], FILTER_VALIDATE_INT);
+/*
+|--------------------------------------------------------------------------
+| Education ID
+|--------------------------------------------------------------------------
+*/
+$id = trim((string) ($input['id'] ?? ''));
 
-if ($businessId === false || $businessId <= 0) {
-    sendJson(false, 'A valid business id is required.', [], 422);
+if ($id === '') {
+    sendJson(false, 'Education id is required.', [], 422);
+}
+
+if (!ctype_digit($id)) {
+    sendJson(false, 'Invalid education id.', [], 422);
+}
+
+$educationId = (int) $id;
+
+if ($educationId <= 0) {
+    sendJson(false, 'Invalid education id.', [], 422);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Required fields
+|--------------------------------------------------------------------------
+*/
+$institution = isset($input['institution'])
+    ? trim((string) $input['institution'])
+    : '';
+
+$qualification = isset($input['qualification'])
+    ? trim((string) $input['qualification'])
+    : '';
+
+if ($institution === '') {
+    sendJson(false, 'Institution is required.', [], 422);
+}
+
+if ($qualification === '') {
+    sendJson(false, 'Qualification is required.', [], 422);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Optional fields
+|--------------------------------------------------------------------------
+*/
+$fieldOfStudy = isset($input['field_of_study'])
+    ? trim((string) $input['field_of_study'])
+    : null;
+
+$startDate = isset($input['start_date'])
+    ? trim((string) $input['start_date'])
+    : null;
+
+$endDate = isset($input['end_date'])
+    ? trim((string) $input['end_date'])
+    : null;
+
+$description = isset($input['description'])
+    ? trim((string) $input['description'])
+    : null;
+
+/*
+|--------------------------------------------------------------------------
+| Convert blank optional fields to NULL
+|--------------------------------------------------------------------------
+*/
+$fieldOfStudy = ($fieldOfStudy === '') ? null : $fieldOfStudy;
+$startDate = ($startDate === '') ? null : $startDate;
+$endDate = ($endDate === '') ? null : $endDate;
+$description = ($description === '') ? null : $description;
+
+/*
+|--------------------------------------------------------------------------
+| Validate dates
+|--------------------------------------------------------------------------
+*/
+validateDate($startDate, 'start date');
+validateDate($endDate, 'end date');
+
+/*
+|--------------------------------------------------------------------------
+| Validate date order
+|--------------------------------------------------------------------------
+*/
+if (
+    $startDate !== null &&
+    $endDate !== null &&
+    $endDate < $startDate
+) {
+    sendJson(
+        false,
+        'End date cannot be earlier than start date.',
+        [],
+        422
+    );
 }
 
 try {
+
+    /*
+    |--------------------------------------------------------------------------
+    | Database connection
+    |--------------------------------------------------------------------------
+    */
     $database = new Database();
     $pdo = $database->connect();
 
     /*
     |--------------------------------------------------------------------------
-    | Check Business Ownership
+    | Check ownership
     |--------------------------------------------------------------------------
     */
-
-    $stmt = $pdo->prepare(
+    $check = $pdo->prepare(
         'SELECT id
-         FROM businesses
+         FROM education
          WHERE id = :id
-           AND owner_id = :owner_id
+           AND user_id = :user_id
          LIMIT 1'
     );
 
-    $stmt->execute([
-        ':id' => $businessId,
-        ':owner_id' => $userId
+    $check->execute([
+        ':id' => $educationId,
+        ':user_id' => $userId
     ]);
 
-    if (!$stmt->fetch()) {
-        sendJson(
-            false,
-            'Business not found or you are not the owner.',
-            [],
-            404
-        );
+    $existing = $check->fetch(PDO::FETCH_ASSOC);
+
+    if (!$existing) {
+        sendJson(false, 'Education record not found.', [], 404);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Get Fields
+    | Update education record
     |--------------------------------------------------------------------------
     */
-
-    $name = trim((string) ($_POST['name'] ?? ''));
-    $slug = trim((string) ($_POST['slug'] ?? ''));
-    $description = trim((string) ($_POST['description'] ?? ''));
-    $category = isset($_POST['category'])
-        ? trim((string) $_POST['category'])
-        : '';
-    $phone = trim((string) ($_POST['phone'] ?? ''));
-    $email = trim((string) ($_POST['email'] ?? ''));
-    $website = trim((string) ($_POST['website'] ?? ''));
-    $address = trim((string) ($_POST['address'] ?? ''));
-
-    if ($name === '') {
-        sendJson(false, 'Business name is required.', [], 422);
-    }
-
-    if ($slug === '') {
-        sendJson(false, 'Business slug is required.', [], 422);
-    }
-
-    if (!preg_match('/^[a-z0-9]+(?:-[a-z0-9]+)*$/', $slug)) {
-        sendJson(
-            false,
-            'Slug may only contain lowercase letters, numbers, and hyphens.',
-            [],
-            422
-        );
-    }
-
-    if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        sendJson(false, 'Invalid email address.', [], 422);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Check Duplicate Slug
-    |--------------------------------------------------------------------------
-    */
-
     $stmt = $pdo->prepare(
-        'SELECT id
-         FROM businesses
-         WHERE slug = :slug
-           AND id != :id
-         LIMIT 1'
-    );
-
-    $stmt->execute([
-        ':slug' => $slug,
-        ':id' => $businessId
-    ]);
-
-    if ($stmt->fetch()) {
-        sendJson(false, 'Business slug already exists.', [], 409);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Update Business
-    |--------------------------------------------------------------------------
-    */
-
-    $stmt = $pdo->prepare(
-        'UPDATE businesses
+        'UPDATE education
          SET
-            name = :name,
-            slug = :slug,
+            institution = :institution,
+            qualification = :qualification,
+            field_of_study = :field_of_study,
+            start_date = :start_date,
+            end_date = :end_date,
             description = :description,
-            category = :category,
-            phone = :phone,
-            email = :email,
-            website = :website,
-            address = :address
+            updated_at = CURRENT_TIMESTAMP
          WHERE id = :id
-           AND owner_id = :owner_id'
+           AND user_id = :user_id'
     );
 
     $stmt->execute([
-        ':name' => $name,
-        ':slug' => $slug,
-        ':description' => $description !== '' ? $description : null,
-        ':category' => $category !== '' ? $category : null,
-        ':phone' => $phone !== '' ? $phone : null,
-        ':email' => $email !== '' ? $email : null,
-        ':website' => $website !== '' ? $website : null,
-        ':address' => $address !== '' ? $address : null,
-        ':id' => $businessId,
-        ':owner_id' => $userId
+        ':institution' => $institution,
+        ':qualification' => $qualification,
+        ':field_of_study' => $fieldOfStudy,
+        ':start_date' => $startDate,
+        ':end_date' => $endDate,
+        ':description' => $description,
+        ':id' => $educationId,
+        ':user_id' => $userId
     ]);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Retrieve updated record
+    |--------------------------------------------------------------------------
+    */
+    $get = $pdo->prepare(
+        'SELECT
+            id,
+            user_id,
+            institution,
+            qualification,
+            field_of_study,
+            start_date,
+            end_date,
+            description,
+            created_at,
+            updated_at
+         FROM education
+         WHERE id = :id
+           AND user_id = :user_id
+         LIMIT 1'
+    );
+
+    $get->execute([
+        ':id' => $educationId,
+        ':user_id' => $userId
+    ]);
+
+    $education = $get->fetch(PDO::FETCH_ASSOC);
+
+    if (!$education) {
+        sendJson(
+            false,
+            'Education record could not be retrieved after update.',
+            [],
+            500
+        );
+    }
 
     sendJson(
         true,
-        'Business updated successfully.',
-        [
-            'business_id' => $businessId,
-            'owner_id' => $userId,
-            'name' => $name,
-            'slug' => $slug,
-            'status' => 'active'
-        ]
+        'Education record updated successfully.',
+        $education
     );
 
 } catch (PDOException $e) {
-
-    sendJson(
-        false,
-        'Database error.',
-        [],
-        500
-    );
+    sendJson(false, 'Database error.', [], 500);
 }
