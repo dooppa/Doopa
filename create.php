@@ -2,62 +2,19 @@
 
 declare(strict_types=1);
 
-/*
-|--------------------------------------------------------------------------
-| DOOPA - CREATE COMMUNITY
-|--------------------------------------------------------------------------
-| Batch 10B
-|
-| POST /api/communities/create.php
-|
-| Creates a community and automatically makes the authenticated
-| user the owner and first active member.
-|--------------------------------------------------------------------------
-*/
-
-header('Content-Type: application/json; charset=utf-8');
-
-session_start();
-
 require_once __DIR__ . '/../../config/config.php';
 require_once __DIR__ . '/../../config/database.php';
 
+header('Content-Type: application/json; charset=UTF-8');
 
 /*
 |--------------------------------------------------------------------------
-| JSON RESPONSE HELPER
-|--------------------------------------------------------------------------
-*/
-
-function sendJson(
-    bool $success,
-    string $message,
-    array $data = [],
-    int $statusCode = 200
-): void {
-    http_response_code($statusCode);
-
-    echo json_encode(
-        [
-            'success' => $success,
-            'message' => $message,
-            'data' => $data
-        ],
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
-    );
-
-    exit;
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| REQUEST METHOD
+| Only allow POST requests
 |--------------------------------------------------------------------------
 */
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    sendJson(
+    jsonResponse(
         false,
         'Only POST requests are allowed.',
         [],
@@ -65,10 +22,9 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     );
 }
 
-
 /*
 |--------------------------------------------------------------------------
-| AUTHENTICATION
+| Authentication
 |--------------------------------------------------------------------------
 */
 
@@ -76,7 +32,7 @@ if (
     empty($_SESSION['logged_in']) ||
     empty($_SESSION['user_id'])
 ) {
-    sendJson(
+    jsonResponse(
         false,
         'Authentication required.',
         [],
@@ -86,429 +42,242 @@ if (
 
 $userId = (int) $_SESSION['user_id'];
 
-if ($userId <= 0) {
-    sendJson(
+/*
+|--------------------------------------------------------------------------
+| Read JSON request
+|--------------------------------------------------------------------------
+*/
+
+$input = json_decode(
+    file_get_contents('php://input'),
+    true
+);
+
+if (!is_array($input)) {
+    jsonResponse(
         false,
-        'Invalid authenticated user.',
+        'Invalid JSON request.',
         [],
-        401
+        400
     );
 }
 
+/*
+|--------------------------------------------------------------------------
+| Validate participant
+|--------------------------------------------------------------------------
+*/
+
+$participantId = (int) ($input['user_id'] ?? 0);
+
+if ($participantId <= 0) {
+    jsonResponse(
+        false,
+        'Valid user ID is required.',
+        [],
+        422
+    );
+}
 
 /*
 |--------------------------------------------------------------------------
-| DATABASE
+| Prevent conversation with yourself
+|--------------------------------------------------------------------------
+*/
+
+if ($participantId === $userId) {
+    jsonResponse(
+        false,
+        'You cannot create a conversation with yourself.',
+        [],
+        422
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Database
 |--------------------------------------------------------------------------
 */
 
 try {
+
     $database = new Database();
     $pdo = $database->connect();
 
-    $pdo->setAttribute(
-        PDO::ATTR_ERRMODE,
-        PDO::ERRMODE_EXCEPTION
-    );
-
-} catch (Throwable $e) {
-
-    error_log(
-        'Doopa create community database error: ' .
-        $e->getMessage()
-    );
-
-    sendJson(
-        false,
-        'Database connection failed.',
-        [],
-        500
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| INPUT
-|--------------------------------------------------------------------------
-*/
-
-$name = '';
-
-if (isset($_POST['name'])) {
-    $name = trim((string) $_POST['name']);
-}
-
-$description = null;
-
-if (isset($_POST['description'])) {
-    $description = trim((string) $_POST['description']);
-
-    if ($description === '') {
-        $description = null;
-    }
-}
-
-$privacy = 'public';
-
-if (isset($_POST['privacy'])) {
-    $privacy = strtolower(
-        trim((string) $_POST['privacy'])
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| VALIDATE NAME
-|--------------------------------------------------------------------------
-*/
-
-if ($name === '') {
-    sendJson(
-        false,
-        'Community name is required.',
-        [],
-        422
-    );
-}
-
-$nameLength = function_exists('mb_strlen')
-    ? mb_strlen($name)
-    : strlen($name);
-
-if ($nameLength < 2) {
-    sendJson(
-        false,
-        'Community name must contain at least 2 characters.',
-        [],
-        422
-    );
-}
-
-if ($nameLength > 100) {
-    sendJson(
-        false,
-        'Community name cannot exceed 100 characters.',
-        [],
-        422
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| VALIDATE DESCRIPTION
-|--------------------------------------------------------------------------
-*/
-
-if ($description !== null) {
-
-    $descriptionLength = function_exists('mb_strlen')
-        ? mb_strlen($description)
-        : strlen($description);
-
-    if ($descriptionLength > 5000) {
-        sendJson(
-            false,
-            'Community description cannot exceed 5000 characters.',
-            [],
-            422
-        );
-    }
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| VALIDATE PRIVACY
-|--------------------------------------------------------------------------
-*/
-
-if (!in_array(
-    $privacy,
-    ['public', 'private'],
-    true
-)) {
-    sendJson(
-        false,
-        'Privacy must be either public or private.',
-        [],
-        422
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| CREATE BASE SLUG
-|--------------------------------------------------------------------------
-*/
-
-$slugBase = strtolower($name);
-
-$slugBase = preg_replace(
-    '/[^a-z0-9]+/i',
-    '-',
-    $slugBase
-);
-
-$slugBase = trim(
-    (string) $slugBase,
-    '-'
-);
-
-if ($slugBase === '') {
-    $slugBase = 'community';
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| LIMIT SLUG LENGTH
-|--------------------------------------------------------------------------
-*/
-
-$slugBase = substr($slugBase, 0, 100);
-
-$slug = $slugBase;
-
-
-/*
-|--------------------------------------------------------------------------
-| DATABASE TRANSACTION
-|--------------------------------------------------------------------------
-*/
-
-try {
-
-    $pdo->beginTransaction();
-
-
     /*
     |--------------------------------------------------------------------------
-    | VERIFY USER
+    | Check that the other user exists
     |--------------------------------------------------------------------------
     */
 
     $userStmt = $pdo->prepare(
-        'SELECT id
+        'SELECT id, full_name, username, avatar_url
          FROM users
-         WHERE id = :id
+         WHERE id = :user_id
          LIMIT 1'
     );
 
     $userStmt->execute([
-        ':id' => $userId
+        ':user_id' => $participantId
     ]);
 
-    $user = $userStmt->fetch(PDO::FETCH_ASSOC);
+    $participant = $userStmt->fetch();
 
-    if (!$user) {
-        $pdo->rollBack();
-
-        sendJson(
+    if (!$participant) {
+        jsonResponse(
             false,
-            'Authenticated user was not found.',
+            'User not found.',
             [],
-            401
+            404
         );
     }
 
-
     /*
     |--------------------------------------------------------------------------
-    | FIND UNIQUE SLUG
+    | Find existing direct conversation
     |--------------------------------------------------------------------------
     */
 
-    $slugNumber = 1;
-
-    while (true) {
-
-        $slugStmt = $pdo->prepare(
-            'SELECT id
-             FROM communities
-             WHERE slug = :slug
-             LIMIT 1'
-        );
-
-        $slugStmt->execute([
-            ':slug' => $slug
-        ]);
-
-        $existingSlug = $slugStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$existingSlug) {
-            break;
-        }
-
-        $slugNumber++;
-
-        $suffix = '-' . $slugNumber;
-
-        $maxBaseLength = 120 - strlen($suffix);
-
-        $slug = substr(
-            $slugBase,
-            0,
-            $maxBaseLength
-        ) . $suffix;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | INSERT COMMUNITY
-    |--------------------------------------------------------------------------
-    */
-
-    $communityStmt = $pdo->prepare(
-        'INSERT INTO communities
-        (
-            name,
-            slug,
-            description,
-            privacy,
-            created_by
-        )
-        VALUES
-        (
-            :name,
-            :slug,
-            :description,
-            :privacy,
-            :created_by
-        )'
+    $existingStmt = $pdo->prepare(
+        'SELECT c.id
+         FROM conversations c
+         INNER JOIN conversation_participants cp1
+             ON cp1.conversation_id = c.id
+         INNER JOIN conversation_participants cp2
+             ON cp2.conversation_id = c.id
+         WHERE c.type = :type
+           AND cp1.user_id = :user_id
+           AND cp2.user_id = :participant_id
+         LIMIT 1'
     );
 
-    $communityStmt->execute([
-        ':name' => $name,
-        ':slug' => $slug,
-        ':description' => $description,
-        ':privacy' => $privacy,
+    $existingStmt->execute([
+        ':type' => 'direct',
+        ':user_id' => $userId,
+        ':participant_id' => $participantId
+    ]);
+
+    $existingConversation = $existingStmt->fetch();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Return existing conversation
+    |--------------------------------------------------------------------------
+    */
+
+    if ($existingConversation) {
+
+        jsonResponse(
+            true,
+            'Conversation already exists.',
+            [
+                'conversation_id' => (int) $existingConversation['id'],
+                'type' => 'direct',
+                'created' => false,
+                'participant' => [
+                    'id' => (int) $participant['id'],
+                    'full_name' => $participant['full_name'],
+                    'username' => $participant['username'],
+                    'avatar_url' => $participant['avatar_url']
+                ]
+            ]
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Create conversation
+    |--------------------------------------------------------------------------
+    */
+
+    $pdo->beginTransaction();
+
+    $conversationStmt = $pdo->prepare(
+        'INSERT INTO conversations
+            (type, name, created_by)
+         VALUES
+            (:type, NULL, :created_by)'
+    );
+
+    $conversationStmt->execute([
+        ':type' => 'direct',
         ':created_by' => $userId
     ]);
 
-    $communityId = (int) $pdo->lastInsertId();
-
+    $conversationId = (int) $pdo->lastInsertId();
 
     /*
     |--------------------------------------------------------------------------
-    | ADD CREATOR AS OWNER
+    | Add current user
     |--------------------------------------------------------------------------
     */
 
-    $memberStmt = $pdo->prepare(
-        'INSERT INTO community_members
-        (
-            community_id,
-            user_id,
-            role,
-            status
-        )
-        VALUES
-        (
-            :community_id,
-            :user_id,
-            :role,
-            :status
-        )'
+    $participantStmt = $pdo->prepare(
+        'INSERT INTO conversation_participants
+            (conversation_id, user_id)
+         VALUES
+            (:conversation_id, :user_id)'
     );
 
-    $memberStmt->execute([
-        ':community_id' => $communityId,
-        ':user_id' => $userId,
-        ':role' => 'owner',
-        ':status' => 'active'
+    $participantStmt->execute([
+        ':conversation_id' => $conversationId,
+        ':user_id' => $userId
     ]);
-
 
     /*
     |--------------------------------------------------------------------------
-    | COMMIT
+    | Add other participant
+    |--------------------------------------------------------------------------
+    */
+
+    $participantStmt->execute([
+        ':conversation_id' => $conversationId,
+        ':user_id' => $participantId
+    ]);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Commit
     |--------------------------------------------------------------------------
     */
 
     $pdo->commit();
 
-
     /*
     |--------------------------------------------------------------------------
-    | RETURN COMMUNITY
+    | Return created conversation
     |--------------------------------------------------------------------------
     */
 
-    sendJson(
+    jsonResponse(
         true,
-        'Community created successfully.',
+        'Conversation created successfully.',
         [
-            'community' => [
-                'id' => $communityId,
-                'name' => $name,
-                'slug' => $slug,
-                'description' => $description,
-                'avatar_url' => null,
-                'cover_url' => null,
-                'privacy' => $privacy,
-                'created_by' => $userId,
-                'role' => 'owner',
-                'member_status' => 'active'
+            'conversation_id' => $conversationId,
+            'type' => 'direct',
+            'created' => true,
+            'participant' => [
+                'id' => (int) $participant['id'],
+                'full_name' => $participant['full_name'],
+                'username' => $participant['username'],
+                'avatar_url' => $participant['avatar_url']
             ]
         ],
         201
     );
 
-
 } catch (PDOException $e) {
 
-    if ($pdo->inTransaction()) {
+    if (isset($pdo) && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
 
-    error_log(
-        'Doopa create community PDO error: ' .
-        $e->getMessage()
-    );
-
-    /*
-    |--------------------------------------------------------------------------
-    | UNIQUE SLUG FALLBACK
-    |--------------------------------------------------------------------------
-    */
-
-    if ((int) $e->errorInfo[1] === 1062) {
-        sendJson(
-            false,
-            'A community with this generated slug already exists. Please try again.',
-            [],
-            409
-        );
-    }
-
-    sendJson(
+    jsonResponse(
         false,
-        'Failed to create community.',
-        [],
-        500
-    );
-
-
-} catch (Throwable $e) {
-
-    if ($pdo->inTransaction()) {
-        $pdo->rollBack();
-    }
-
-    error_log(
-        'Doopa create community error: ' .
-        $e->getMessage()
-    );
-
-    sendJson(
-        false,
-        'An unexpected error occurred.',
+        'Unable to create conversation.',
         [],
         500
     );
 }
+
