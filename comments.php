@@ -2,145 +2,305 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/auth.php';
+/*
+|--------------------------------------------------------------------------
+| DOOPA - RETRIEVE COMMUNITY POST COMMENTS
+|--------------------------------------------------------------------------
+*/
 
-header('Content-Type: application/json; charset=UTF-8');
+header('Content-Type: application/json; charset=utf-8');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    http_response_code(405);
+session_start();
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../config/database.php';
+
+function sendJson(
+    bool $success,
+    string $message,
+    array $data = [],
+    int $httpCode = 200
+): never {
+    http_response_code($httpCode);
 
     echo json_encode([
-        'success' => false,
-        'message' => 'Only GET requests are allowed.',
-        'data' => []
-    ]);
+        'success' => $success,
+        'message' => $message,
+        'data' => $data
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
     exit;
 }
 
-$page = isset($_GET['page']) ? (int) $_GET['page'] : 1;
-$limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 20;
+/*
+|--------------------------------------------------------------------------
+| Request method
+|--------------------------------------------------------------------------
+*/
 
-if ($page < 1) {
-    $page = 1;
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    sendJson(
+        false,
+        'Only GET requests are allowed.',
+        [],
+        405
+    );
 }
 
-if ($limit < 1) {
-    $limit = 20;
+/*
+|--------------------------------------------------------------------------
+| Authentication
+|--------------------------------------------------------------------------
+*/
+
+if (
+    empty($_SESSION['logged_in']) ||
+    empty($_SESSION['user_id'])
+) {
+    sendJson(
+        false,
+        'Authentication required.',
+        [],
+        401
+    );
 }
 
-if ($limit > 50) {
-    $limit = 50;
+$currentUserId = (int) $_SESSION['user_id'];
+
+/*
+|--------------------------------------------------------------------------
+| Input
+|--------------------------------------------------------------------------
+*/
+
+$postId = filter_input(
+    INPUT_GET,
+    'post_id',
+    FILTER_VALIDATE_INT
+);
+
+$page = filter_input(
+    INPUT_GET,
+    'page',
+    FILTER_VALIDATE_INT
+);
+
+$limit = filter_input(
+    INPUT_GET,
+    'limit',
+    FILTER_VALIDATE_INT
+);
+
+if (!$postId || $postId <= 0) {
+    sendJson(
+        false,
+        'A valid post_id is required.',
+        [],
+        422
+    );
+}
+
+$page = ($page && $page > 0) ? $page : 1;
+$limit = ($limit && $limit > 0) ? $limit : 20;
+
+if ($limit > 100) {
+    $limit = 100;
 }
 
 $offset = ($page - 1) * $limit;
 
-$q = trim($_GET['q'] ?? '');
-
-if (mb_strlen($q) > 50) {
-    http_response_code(422);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Search query must not exceed 50 characters.',
-        'data' => []
-    ]);
-
-    exit;
-}
+/*
+|--------------------------------------------------------------------------
+| Database
+|--------------------------------------------------------------------------
+*/
 
 try {
 
-    $where = [];
-    $params = [];
+    $database = new Database();
+    $pdo = $database->connect();
 
-    if ($q !== '') {
+    /*
+    |--------------------------------------------------------------------------
+    | Verify post
+    |--------------------------------------------------------------------------
+    */
 
-        $where[] = "
-            (
-                pc.content LIKE :content
-                OR u.username LIKE :username
-                OR u.full_name LIKE :full_name
-            )
-        ";
+    $postStmt = $pdo->prepare(
+        "SELECT
+            id,
+            community_id,
+            user_id,
+            post_type,
+            is_deleted
+         FROM community_posts
+         WHERE id = :post_id
+         LIMIT 1"
+    );
 
-        $search = '%' . $q . '%';
+    $postStmt->execute([
+        ':post_id' => $postId
+    ]);
 
-        $params[':content'] = $search;
-        $params[':username'] = $search;
-        $params[':full_name'] = $search;
+    $post = $postStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$post) {
+        sendJson(
+            false,
+            'Community post not found.',
+            [],
+            404
+        );
     }
 
-    $whereSql = '';
-
-    if (!empty($where)) {
-        $whereSql = 'WHERE ' . implode(' AND ', $where);
+    if ((int) $post['is_deleted'] === 1) {
+        sendJson(
+            false,
+            'Cannot retrieve comments from a deleted community post.',
+            [
+                'post_id' => $postId
+            ],
+            410
+        );
     }
 
-    $countStmt = $pdo->prepare("
-        SELECT COUNT(*)
-        FROM post_comments pc
-        INNER JOIN users u ON u.id = pc.user_id
-        $whereSql
-    ");
+    $communityId = (int) $post['community_id'];
 
-    $countStmt->execute($params);
+    /*
+    |--------------------------------------------------------------------------
+    | Verify active community membership
+    |--------------------------------------------------------------------------
+    */
 
-    $total = (int) $countStmt->fetchColumn();
+    $memberStmt = $pdo->prepare(
+        "SELECT
+            role,
+            status
+         FROM community_members
+         WHERE community_id = :community_id
+           AND user_id = :user_id
+         LIMIT 1"
+    );
 
-    $sql = "
+    $memberStmt->execute([
+        ':community_id' => $communityId,
+        ':user_id' => $currentUserId
+    ]);
+
+    $membership = $memberStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$membership) {
+        sendJson(
+            false,
+            'You are not a member of this community.',
+            [
+                'community_id' => $communityId
+            ],
+            403
+        );
+    }
+
+    if ($membership['status'] !== 'active') {
+        sendJson(
+            false,
+            'Your community membership is not active.',
+            [
+                'status' => $membership['status']
+            ],
+            403
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Count active comments
+    |--------------------------------------------------------------------------
+    */
+
+    $countStmt = $pdo->prepare(
+        "SELECT COUNT(*)
+         FROM community_post_comments
+         WHERE post_id = :post_id
+           AND is_deleted = 0"
+    );
+
+    $countStmt->execute([
+        ':post_id' => $postId
+    ]);
+
+    $totalComments = (int) $countStmt->fetchColumn();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Retrieve comments
+    |--------------------------------------------------------------------------
+    */
+
+    $commentsSql = "
         SELECT
-            pc.id,
-            pc.post_id,
-            pc.user_id,
+            c.id,
+            c.post_id,
+            c.user_id,
+            c.parent_id,
+            c.comment,
+            c.is_deleted,
+            c.created_at,
+            c.updated_at,
             u.username,
             u.full_name,
-            u.avatar_url,
-            pc.content,
-            pc.created_at,
-            pc.updated_at
-        FROM post_comments pc
-        INNER JOIN users u ON u.id = pc.user_id
-        $whereSql
-        ORDER BY pc.created_at DESC
-        LIMIT :limit OFFSET :offset
+            u.avatar_url
+        FROM community_post_comments c
+        INNER JOIN users u
+            ON u.id = c.user_id
+        WHERE c.post_id = :post_id
+          AND c.is_deleted = 0
+        ORDER BY
+            c.created_at ASC,
+            c.id ASC
+        LIMIT {$limit} OFFSET {$offset}
     ";
 
-    $stmt = $pdo->prepare($sql);
+    $commentsStmt = $pdo->prepare($commentsSql);
 
-    foreach ($params as $key => $value) {
-        $stmt->bindValue($key, $value, PDO::PARAM_STR);
-    }
+    $commentsStmt->execute([
+        ':post_id' => $postId
+    ]);
 
-    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $comments = $commentsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $stmt->execute();
+    /*
+    |--------------------------------------------------------------------------
+    | Pagination
+    |--------------------------------------------------------------------------
+    */
 
-    $comments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $totalPages = $totalComments > 0
+        ? (int) ceil($totalComments / $limit)
+        : 0;
 
-    echo json_encode([
-        'success' => true,
-        'message' => 'Admin comments retrieved successfully.',
-        'data' => [
+    sendJson(
+        true,
+        'Community comments retrieved successfully.',
+        [
+            'post_id' => $postId,
+            'community_id' => $communityId,
+            'count' => count($comments),
+            'total_comments' => $totalComments,
             'page' => $page,
             'limit' => $limit,
-            'total' => $total,
-            'count' => count($comments),
-            'query' => $q,
+            'total_pages' => $totalPages,
             'comments' => $comments
         ]
-    ]);
+    );
 
-} catch (PDOException $e) {
+} catch (Throwable $e) {
 
-    http_response_code(500);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Unable to retrieve comments.',
-        'data' => []
-    ]);
-
-    exit;
+    sendJson(
+        false,
+        'Failed to retrieve community comments.',
+        [
+            'error' => $e->getMessage()
+        ],
+        500
+    );
 }

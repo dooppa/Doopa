@@ -2,209 +2,248 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/auth.php';
+/*
+|--------------------------------------------------------------------------
+| DOOPA - COMMUNITY POST RETRIEVAL
+|--------------------------------------------------------------------------
+*/
 
-header('Content-Type: application/json; charset=UTF-8');
+header('Content-Type: application/json; charset=utf-8');
+
+function sendJson(
+    bool $success,
+    string $message,
+    array $data = [],
+    int $status = 200
+): never {
+    http_response_code($status);
+
+    echo json_encode([
+        'success' => $success,
+        'message' => $message,
+        'data'    => $data
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    exit;
+}
 
 /*
 |--------------------------------------------------------------------------
-| Only allow GET requests
+| METHOD
 |--------------------------------------------------------------------------
 */
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    http_response_code(405);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Only GET requests are allowed.',
-        'data' => []
-    ]);
-
-    exit;
+    sendJson(
+        false,
+        'Only GET requests are allowed.',
+        [],
+        405
+    );
 }
 
 /*
 |--------------------------------------------------------------------------
-| Pagination
+| SESSION
 |--------------------------------------------------------------------------
 */
 
-$page = isset($_GET['page']) ? (int) $_GET['page'] : 1;
-$limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 20;
-
-if ($page < 1) {
-    $page = 1;
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
 }
 
-if ($limit < 1) {
-    $limit = 20;
+if (
+    empty($_SESSION['logged_in']) ||
+    empty($_SESSION['user_id'])
+) {
+    sendJson(
+        false,
+        'Authentication required.',
+        [],
+        401
+    );
 }
 
-if ($limit > 50) {
-    $limit = 50;
-}
-
-$offset = ($page - 1) * $limit;
+$currentUserId = (int) $_SESSION['user_id'];
 
 /*
 |--------------------------------------------------------------------------
-| Search
+| DATABASE
 |--------------------------------------------------------------------------
 */
 
-$q = trim($_GET['q'] ?? '');
-
-if (mb_strlen($q) > 50) {
-    http_response_code(422);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Search query must not exceed 50 characters.',
-        'data' => []
-    ]);
-
-    exit;
-}
-
-/*
-|--------------------------------------------------------------------------
-| Retrieve posts
-|--------------------------------------------------------------------------
-*/
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../config/database.php';
 
 try {
 
-    $where = [];
-    $params = [];
+    $database = new Database();
+    $pdo = $database->connect();
 
+   /*
+|--------------------------------------------------------------------------
+| INPUT
+|--------------------------------------------------------------------------
+*/
+
+if (!isset($_GET['community_id'])) {
+    sendJson(
+        false,
+        'community_id is required.',
+        [],
+        422
+    );
+}
+
+$communityId = filter_var(
+    $_GET['community_id'],
+    FILTER_VALIDATE_INT
+);
+
+if ($communityId === false || $communityId <= 0) {
+    sendJson(
+        false,
+        'A valid community_id is required.',
+        [],
+        422
+    );
+}
     /*
     |--------------------------------------------------------------------------
-    | Search by content, username, or full name
+    | VERIFY COMMUNITY
     |--------------------------------------------------------------------------
     */
 
-    if ($q !== '') {
-
-        $where[] = "
-            (
-                p.content LIKE :content
-                OR u.username LIKE :username
-                OR u.full_name LIKE :full_name
-            )
-        ";
-
-        $search = '%' . $q . '%';
-
-        $params[':content'] = $search;
-        $params[':username'] = $search;
-        $params[':full_name'] = $search;
-    }
-
-    $whereSql = '';
-
-    if (!empty($where)) {
-        $whereSql = 'WHERE ' . implode(' AND ', $where);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Count posts
-    |--------------------------------------------------------------------------
-    */
-
-    $countStmt = $pdo->prepare("
-        SELECT COUNT(*)
-        FROM posts p
-        INNER JOIN users u ON u.id = p.user_id
-        $whereSql
+    $stmt = $pdo->prepare("
+        SELECT
+            id,
+            name,
+            slug,
+            privacy
+        FROM communities
+        WHERE id = ?
+        LIMIT 1
     ");
 
-    $countStmt->execute($params);
+    $stmt->execute([
+        $communityId
+    ]);
 
-    $total = (int) $countStmt->fetchColumn();
+    $community = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$community) {
+        sendJson(
+            false,
+            'Community not found.',
+            [],
+            404
+        );
+    }
 
     /*
     |--------------------------------------------------------------------------
-    | Retrieve posts
+    | VERIFY MEMBERSHIP
     |--------------------------------------------------------------------------
-    |
-    | The posts table does NOT contain post_type.
-    |
     */
 
-    $sql = "
+    $stmt = $pdo->prepare("
         SELECT
-            p.id,
-            p.user_id,
+            role,
+            status
+        FROM community_members
+        WHERE community_id = ?
+          AND user_id = ?
+        LIMIT 1
+    ");
+
+    $stmt->execute([
+        $communityId,
+        $currentUserId
+    ]);
+
+    $membership = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$membership) {
+        sendJson(
+            false,
+            'You are not a member of this community.',
+            [],
+            403
+        );
+    }
+
+    if ($membership['status'] !== 'active') {
+        sendJson(
+            false,
+            'Your community membership is not active.',
+            [
+                'status' => $membership['status']
+            ],
+            403
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | RETRIEVE POSTS
+    |--------------------------------------------------------------------------
+    */
+
+    $stmt = $pdo->prepare("
+        SELECT
+            cp.id,
+            cp.community_id,
+            cp.user_id,
             u.username,
             u.full_name,
             u.avatar_url,
-            p.content,
-            p.media_url,
-            p.created_at,
-            p.updated_at
-        FROM posts p
-        INNER JOIN users u ON u.id = p.user_id
-        $whereSql
-        ORDER BY p.created_at DESC
-        LIMIT :limit OFFSET :offset
-    ";
+            cp.content,
+            cp.post_type,
+            cp.media_url,
+            cp.is_deleted,
+            cp.created_at,
+            cp.updated_at
+        FROM community_posts cp
+        INNER JOIN users u
+            ON u.id = cp.user_id
+        WHERE cp.community_id = ?
+          AND cp.is_deleted = 0
+        ORDER BY cp.created_at DESC
+    ");
 
-    $stmt = $pdo->prepare($sql);
-
-    /*
-    |--------------------------------------------------------------------------
-    | Bind search parameters
-    |--------------------------------------------------------------------------
-    */
-
-    foreach ($params as $key => $value) {
-        $stmt->bindValue($key, $value, PDO::PARAM_STR);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Bind pagination parameters
-    |--------------------------------------------------------------------------
-    */
-
-    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-
-    $stmt->execute();
+    $stmt->execute([
+        $communityId
+    ]);
 
     $posts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     /*
     |--------------------------------------------------------------------------
-    | Success response
+    | RESPONSE
     |--------------------------------------------------------------------------
     */
 
-    echo json_encode([
-        'success' => true,
-        'message' => 'Admin posts retrieved successfully.',
-        'data' => [
-            'page' => $page,
-            'limit' => $limit,
-            'total' => $total,
+    sendJson(
+        true,
+        'Community posts retrieved successfully.',
+        [
+            'community' => $community,
+            'community_id' => $communityId,
             'count' => count($posts),
-            'query' => $q,
             'posts' => $posts
         ]
-    ]);
+    );
 
-} catch (PDOException $e) {
+} catch (Throwable $e) {
 
-    http_response_code(500);
+    error_log(
+        'Doopa posts.php error: ' . $e->getMessage()
+    );
 
-    echo json_encode([
-        'success' => false,
-        'message' => 'Unable to retrieve posts.',
-        'data' => []
-    ]);
-
-    exit;
+    sendJson(
+        false,
+        'A server error occurred while retrieving community posts.',
+        [],
+        500
+    );
 }
-

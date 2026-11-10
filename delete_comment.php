@@ -2,159 +2,276 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/auth.php';
-require_once __DIR__ . '/log_activity.php';
+/*
+|--------------------------------------------------------------------------
+| DOOPA - DELETE COMMUNITY POST COMMENT
+|--------------------------------------------------------------------------
+*/
 
-header('Content-Type: application/json; charset=UTF-8');
+header('Content-Type: application/json; charset=utf-8');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'DELETE') {
-    http_response_code(405);
+session_start();
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../config/database.php';
+
+function sendJson(
+    bool $success,
+    string $message,
+    array $data = [],
+    int $httpCode = 200
+): never {
+    http_response_code($httpCode);
 
     echo json_encode([
-        'success' => false,
-        'message' => 'Only DELETE requests are allowed.',
-        'data' => []
-    ]);
+        'success' => $success,
+        'message' => $message,
+        'data' => $data
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
     exit;
 }
 
-$input = json_decode(
-    file_get_contents('php://input'),
-    true
+/*
+|--------------------------------------------------------------------------
+| Request method
+|--------------------------------------------------------------------------
+*/
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    sendJson(
+        false,
+        'Only POST requests are allowed.',
+        [],
+        405
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Authentication
+|--------------------------------------------------------------------------
+*/
+
+if (
+    empty($_SESSION['logged_in']) ||
+    empty($_SESSION['user_id'])
+) {
+    sendJson(
+        false,
+        'Authentication required.',
+        [],
+        401
+    );
+}
+
+$currentUserId = (int) $_SESSION['user_id'];
+
+/*
+|--------------------------------------------------------------------------
+| Input
+|--------------------------------------------------------------------------
+*/
+
+$commentId = filter_input(
+    INPUT_POST,
+    'comment_id',
+    FILTER_VALIDATE_INT
 );
 
-if (!is_array($input)) {
-    http_response_code(400);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Invalid JSON request.',
-        'data' => []
-    ]);
-
-    exit;
+if (!$commentId || $commentId <= 0) {
+    sendJson(
+        false,
+        'A valid comment_id is required.',
+        [],
+        422
+    );
 }
 
-$commentId = isset($input['comment_id'])
-    ? (int) $input['comment_id']
-    : 0;
-
-if ($commentId <= 0) {
-    http_response_code(422);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Valid comment ID is required.',
-        'data' => []
-    ]);
-
-    exit;
-}
+/*
+|--------------------------------------------------------------------------
+| Database
+|--------------------------------------------------------------------------
+*/
 
 try {
 
+    $database = new Database();
+    $pdo = $database->connect();
+
     /*
     |--------------------------------------------------------------------------
-    | Find comment
+    | Get comment + post + community
     |--------------------------------------------------------------------------
     */
 
-    $stmt = $pdo->prepare("
-        SELECT
-            id,
-            post_id,
-            user_id,
-            content
-        FROM post_comments
-        WHERE id = :comment_id
-        LIMIT 1
-    ");
+    $commentStmt = $pdo->prepare(
+        "SELECT
+            c.id,
+            c.post_id,
+            c.user_id,
+            c.parent_id,
+            c.comment,
+            c.is_deleted,
+            p.community_id
+         FROM community_post_comments c
+         INNER JOIN community_posts p
+             ON p.id = c.post_id
+         WHERE c.id = :comment_id
+         LIMIT 1"
+    );
 
-    $stmt->execute([
+    $commentStmt->execute([
         ':comment_id' => $commentId
     ]);
 
-    $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $comment = $commentStmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$comment) {
-        http_response_code(404);
+        sendJson(
+            false,
+            'Community comment not found.',
+            [],
+            404
+        );
+    }
 
-        echo json_encode([
-            'success' => false,
-            'message' => 'Comment not found.',
-            'data' => []
-        ]);
+    if ((int) $comment['is_deleted'] === 1) {
+        sendJson(
+            false,
+            'Community comment has already been deleted.',
+            [
+                'comment_id' => $commentId,
+                'is_deleted' => 1
+            ],
+            409
+        );
+    }
 
-        exit;
+    $communityId = (int) $comment['community_id'];
+
+    /*
+    |--------------------------------------------------------------------------
+    | Verify active membership
+    |--------------------------------------------------------------------------
+    */
+
+    $memberStmt = $pdo->prepare(
+        "SELECT
+            role,
+            status
+         FROM community_members
+         WHERE community_id = :community_id
+           AND user_id = :user_id
+         LIMIT 1"
+    );
+
+    $memberStmt->execute([
+        ':community_id' => $communityId,
+        ':user_id' => $currentUserId
+    ]);
+
+    $membership = $memberStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$membership) {
+        sendJson(
+            false,
+            'You are not a member of this community.',
+            [
+                'community_id' => $communityId
+            ],
+            403
+        );
+    }
+
+    if ($membership['status'] !== 'active') {
+        sendJson(
+            false,
+            'Your community membership is not active.',
+            [
+                'status' => $membership['status']
+            ],
+            403
+        );
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Store information before deletion
+    | Authorization
     |--------------------------------------------------------------------------
     */
 
-    $postId = (int) $comment['post_id'];
-    $commentOwnerId = (int) $comment['user_id'];
+    $role = $membership['role'];
+
+    $isCommentOwner =
+        (int) $comment['user_id'] === $currentUserId;
+
+    $canModerate = in_array(
+        $role,
+        ['owner', 'admin', 'moderator'],
+        true
+    );
+
+    if (!$isCommentOwner && !$canModerate) {
+        sendJson(
+            false,
+            'You can only delete your own community comments.',
+            [
+                'comment_id' => $commentId
+            ],
+            403
+        );
+    }
 
     /*
     |--------------------------------------------------------------------------
-    | Delete comment
+    | Soft delete
     |--------------------------------------------------------------------------
     */
 
-    $delete = $pdo->prepare("
-        DELETE FROM post_comments
-        WHERE id = :comment_id
-    ");
+    $deleteStmt = $pdo->prepare(
+        "UPDATE community_post_comments
+         SET is_deleted = 1
+         WHERE id = :comment_id
+           AND is_deleted = 0"
+    );
 
-    $delete->execute([
+    $deleteStmt->execute([
         ':comment_id' => $commentId
     ]);
 
-    /*
-    |--------------------------------------------------------------------------
-    | Record admin activity
-    |--------------------------------------------------------------------------
-    */
+    if ($deleteStmt->rowCount() !== 1) {
+        sendJson(
+            false,
+            'Community comment could not be deleted.',
+            [
+                'comment_id' => $commentId
+            ],
+            500
+        );
+    }
 
-    logAdminActivity(
-        $pdo,
-        (int) $_SESSION['user_id'],
-        'delete_comment',
-        'comment',
-        $commentId,
-        'Administrator deleted comment ' . $commentId .
-        ' on post ' . $postId .
-        ' owned by user ' . $commentOwnerId
+    sendJson(
+        true,
+        'Community comment deleted successfully.',
+        [
+            'comment_id' => $commentId,
+            'post_id' => (int) $comment['post_id'],
+            'community_id' => $communityId,
+            'is_deleted' => 1,
+            'deleted_by_role' => $role,
+            'deleted_own_comment' => $isCommentOwner
+        ]
     );
 
-    /*
-    |--------------------------------------------------------------------------
-    | Success response
-    |--------------------------------------------------------------------------
-    */
+} catch (Throwable $e) {
 
-    echo json_encode([
-        'success' => true,
-        'message' => 'Comment deleted successfully by administrator.',
-        'data' => [
-            'comment_id' => $commentId,
-            'post_id' => $postId,
-            'comment_owner_id' => $commentOwnerId
-        ]
-    ]);
-
-} catch (PDOException $e) {
-
-    http_response_code(500);
-
-    echo json_encode([
-        'success' => false,
-        'message' => 'Unable to delete comment.',
-        'data' => []
-    ]);
-
-    exit;
+    sendJson(
+        false,
+        'Failed to delete community comment.',
+        [
+            'error' => $e->getMessage()
+        ],
+        500
+    );
 }
